@@ -297,42 +297,39 @@ def cursor(fd_in: int, fd_out: int) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def show(term: Terminal, png: bytes, cols: int, rows: int, fd_in: int = 0, fd_out: int = 1,
+def show(term: Terminal, png: bytes, cols: int, rows: int, up: int, col: int, fd_in: int = 0, fd_out: int = 1,
          run: Run = run_cmd) -> bool:
-    """PNG drawn at the cursor, COLS cells by ROWS, the cursor left after it
-    on its last row, as text of that size would leave it: True. False when
-    it cannot be drawn (term.draws(), or inside tmux the pane's place not
-    found): the caller names the image's file instead.
+    """PNG drawn COLS cells by ROWS over what is already on the screen, its
+    top-left cell UP rows above the cursor's row, in column COL (from 1);
+    the cursor stays where it is: True. The caller printed the text first,
+    ROWS lines kept free where the image goes, so a terminal that cannot
+    draw shows the text as it is. False when it cannot be drawn
+    (term.draws(), or inside tmux the pane's place not found): nothing
+    written -- the caller names the image's file.
 
     Inside tmux the image goes through passthrough, and the terminal would
     draw it wherever its own cursor is (the window's top-left), so it is
-    placed: ROWS lines are kept free in the pane first, then the pane's
-    cursor (DSR, answered by tmux in order after what was written) plus the
-    pane's place in the window (tmux display-message) gives the terminal's
-    row and column. tmux does not know the image: it is gone when tmux
-    redraws those cells."""
+    placed: the pane's cursor (DSR, which tmux answers after everything
+    written before it) plus the pane's place in the window (tmux
+    display-message) gives the terminal's row and column. tmux does not
+    know the image: it is gone when tmux redraws those cells."""
     if not term.draws():
         return False
     if not term.tmux:
-        os.write(fd_out, "".join(kitty(png, cols, rows)).encode("ascii"))
+        draw = ["\x1b7", f"\x1b[{up}A" if up else "", f"\x1b[{col}G", *kitty(png, cols, rows, stay=True), "\x1b8"]
+        os.write(fd_out, "".join(draw).encode("ascii"))
         return True
-    first = cursor(fd_in, fd_out)
-    if first is None:
-        return False
-    down = rows - 1
-    os.write(fd_out, (("\n" * down + f"\x1b[{down}A" if down else "") + f"\x1b[{first[1]}G").encode("ascii"))
     at = cursor(fd_in, fd_out)
     try:
         top, left, status, where = run(["tmux", "display-message", "-p", TMUX_WHERE]).rstrip("\n").split("\t")
         lines = 1 if status == "on" else int(status) if status.isdigit() else 0
-        row, col = int(top) + (lines if where == "top" else 0), int(left)
+        row, column = int(top) + (lines if where == "top" else 0), int(left)
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
     if at is None:
         return False
-    draw = ["\x1b7", f"\x1b[{row + at[0]};{col + at[1]}H", *kitty(png, cols, rows, stay=True), "\x1b8"]
-    os.write(fd_out, ("".join(passthrough(s) for s in draw) + (f"\x1b[{down}B" if down else "")
-                      + f"\x1b[{cols}C").encode("ascii"))
+    draw = ["\x1b7", f"\x1b[{row + at[0] - up};{column + col}H", *kitty(png, cols, rows, stay=True), "\x1b8"]
+    os.write(fd_out, "".join(passthrough(s) for s in draw).encode("ascii"))
     return True
 
 
@@ -404,11 +401,13 @@ def main(argv: Sequence[str]) -> int:
         if size is None:
             raise Err("002", f"{args[1]}: not a PNG -- kitty's protocol is given PNGs (f=100)")
         term = detect()
-        rows = max(round(SHOW_COLS * size[1] / max(size[0], 1) / 2), 1)   # a cell about twice as tall as wide
-        if not show(term, png, SHOW_COLS, rows):
+        if not term.draws():
             print(f"{args[1]} -- not drawn: {term.said()}")
             return 0
-        print()
+        rows = max(round(SHOW_COLS * size[1] / max(size[0], 1) / 2), 1)   # a cell about twice as tall as wide
+        print("\n" * (rows - 1), flush=True)                               # the rows it is drawn over
+        if not show(term, png, SHOW_COLS, rows, rows, 1):
+            print(f"{args[1]} -- not drawn: tmux did not say where the pane is")
         return 0
     raise Err("003", f"{' '.join(args)!r}: no such command -- {USAGE}", 64)
 
@@ -637,41 +636,41 @@ def t_show_direct(t: T) -> None:
     term = Terminal("iterm2", "iTerm2 3.7.7", False, False, True)
     fake = FakeTerminal({})
     try:
-        ok = show(term, b"png", 4, 2, fake.slave, fake.slave)
+        ok = show(term, b"png", 4, 2, 5, 9, fake.slave, fake.slave)
     finally:
-        seen = fake.close()
-    t.check("drawn at the cursor, as kitty escapes, nothing else", ok and seen == "".join(kitty(b"png", 4, 2)).encode(),
-            repr(seen))
+        seen = fake.close().decode("ascii")
+    t.check("drawn 5 rows up in column 9, the cursor put back, nothing else written",
+            ok and seen == "\x1b7\x1b[5A\x1b[9G" + "".join(kitty(b"png", 4, 2, stay=True)) + "\x1b8", repr(seen))
     fake = FakeTerminal({})
     try:
-        no = show(Terminal("other", "", False, False, True), b"png", 4, 2, fake.slave, fake.slave)
+        no = show(Terminal("other", "", False, False, True), b"png", 4, 2, 5, 9, fake.slave, fake.slave)
     finally:
-        seen = fake.close()
-    t.check("a terminal that draws nothing: False, nothing written", not no and seen == b"", repr(seen))
+        seen = fake.close().decode("ascii")
+    t.check("a terminal that draws nothing: False, nothing written", not no and seen == "", repr(seen))
 
 
 def t_show_tmux(t: T) -> None:
     term = Terminal("iterm2", "iTerm2 3.7.7", True, True, True)
-    fake = FakeTerminal({DSR: [b"\x1b[20;5R", b"\x1b[17;5R"]})     # the pane scrolled: 3 rows kept free
+    fake = FakeTerminal({DSR: [b"\x1b[20;5R"]})
     asked: list[Sequence[str]] = []
 
     def run(words: Sequence[str]) -> str:
         asked.append(words)
         return "2\t40\ton\ttop\n"
     try:
-        ok = show(term, b"png", 4, 4, fake.slave, fake.slave, run)
+        ok = show(term, b"png", 4, 4, 6, 9, fake.slave, fake.slave, run)
     finally:
         seen = fake.close().decode("ascii")
     pt = re.findall(r"\x1bPtmux;((?:[^\x1b]|\x1b\x1b)*)\x1b\\", seen)
     inner = [p.replace("\x1b\x1b", "\x1b") for p in pt]
     t.check("drawn", ok, repr(seen))
-    t.check("rows kept free in the pane, then back up to the first, at the cursor's column",
-            seen.startswith("\x1b[6n\r\n\r\n\r\n\x1b[3A\x1b[5G\x1b[6n"), repr(seen[:40]))
-    t.check("placed at the pane's cursor in the window: row 2 + 1 (the status line on top) + 17, column 40 + 5",
-            inner[:2] == ["\x1b7", "\x1b[20;45H"] and inner[-1] == "\x1b8", repr(inner))
+    t.check("the pane asked where its cursor is (DSR), nothing written to the pane besides",
+            seen.startswith("\x1b[6n\x1bPtmux;") and re.sub(r"\x1bPtmux;(?:[^\x1b]|\x1b\x1b)*\x1b\\", "", seen)
+            == "\x1b[6n", repr(seen[:40]))
+    t.check("placed in the window: row 2 + 1 (the status line on top) + 20 (the pane's cursor) - 6 up, "
+            "column 40 + 9", inner[:2] == ["\x1b7", "\x1b[17;49H"] and inner[-1] == "\x1b8", repr(inner))
     t.check("the image itself, cursor kept, every ESC doubled for tmux", inner[2:-1] == kitty(b"png", 4, 4, stay=True)
             and all(re.fullmatch(r"(?:[^\x1b]|\x1b\x1b)*", p) for p in pt), repr(pt))
-    t.check("the pane's cursor then after the image, as outside tmux", seen.endswith("\x1b[3B\x1b[4C"), repr(seen[-12:]))
     t.check("tmux asked for the pane's place", asked == [["tmux", "display-message", "-p", TMUX_WHERE]], repr(asked))
 
 
@@ -682,7 +681,7 @@ def t_show_tmux_no_place(t: T) -> None:
     def run(words: Sequence[str]) -> str:
         raise subprocess.CalledProcessError(1, list(words))
     try:
-        ok = show(term, b"png", 4, 2, fake.slave, fake.slave, run)
+        ok = show(term, b"png", 4, 2, 2, 1, fake.slave, fake.slave, run)
     finally:
         seen = fake.close()
     t.check("no cursor answer: False, nothing drawn", not ok and b"\x1bPtmux;" not in seen, repr(seen))

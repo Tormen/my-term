@@ -20,7 +20,8 @@ got = my_term.image_from(typed, keep_dir)   # a typed or pasted answer: an image
 if got and got.how == "elsewhere":
     print(got.path, "--", got.said)          # a path on another machine: what to do instead
 
-if not my_term.show(term, png, cols=40, rows=10):
+print("\n" * 9)                # the text first, 10 rows kept free for the image
+if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
     print(png_path)              # cannot be drawn here: name the file
 ```
 
@@ -36,12 +37,16 @@ if not my_term.show(term, png, cols=40, rows=10):
   paste it as base64; base64 that decodes to a PNG, JPEG, GIF or WebP (iTerm2's "Paste Base64-Encoded Contents",
   line breaks and all) is written into `keep_dir` as `pasted-<n>.<type>`, written whole before it gets its name and
   never over another. Words that happen to be valid base64 (`done`) decode to no image: text.
-- **`show(term, png, cols, rows)` -> `bool`**: the PNG drawn at the cursor by kitty's graphics protocol, `cols`
-  cells by `rows`, the cursor left after it on its last row as text of that size would leave it. Inside tmux the
-  image goes through passthrough, placed by the module itself (the terminal would draw it at its own cursor, the
-  window's top-left): it keeps `rows` lines free in the pane, asks the pane for its cursor (DSR) and tmux for the
-  pane's place in the window. tmux does not know the image: it is gone when tmux redraws those cells. `False`: it
-  cannot be drawn here (`term.draws()`, or the pane's place not found) and nothing was written -- name the file.
+- **`show(term, png, cols, rows, up, col)` -> `bool`**: the PNG drawn by kitty's graphics protocol, `cols` cells
+  by `rows`, over what is already on the screen: its top-left cell `up` rows above the cursor's row, in column
+  `col`; the cursor stays where it is. So a tool prints its text first, with the rows kept free where the image
+  goes, and a terminal that cannot draw still shows that text. Inside tmux the image goes through passthrough,
+  placed by the module itself (the terminal would draw it at its own cursor, the window's top-left): the pane is
+  asked for its cursor (DSR) and tmux for the pane's place in the window. tmux does not know the image: it is gone
+  when tmux redraws those cells. `False`: it cannot be drawn here (`term.draws()`, or the pane's place not found)
+  and nothing was written -- name the file.
+
+ere (`term.draws()`, or the pane's place not found) and nothing was written -- name the file.
 
 **What is drawn where** -- `Terminal.draws()`:
 
@@ -82,8 +87,9 @@ Errors are one line on stderr, `ERROR <code> [<rc>]: ...`; Ctrl-C ends with one 
 - `display-message -p` expands an option by name as a format: `#{allow-passthrough}` gave `off`, then `on` after
   `set -g allow-passthrough on`; `#{status}` `on`, `#{status-position}` `bottom`, `#{pane_top}` `0`.
 - `#{client_termtype}` is empty with no client attached.
-- `show()` inside it: the pane answered DSR, `pane_top` and the rest came, it returned True and the pane kept the
-  rows free. Whether the image then lands at the right cell on a real terminal is not observed here (no client).
+- `show()` inside it, after three lines of text: the pane answered DSR, `pane_top` and the rest came, it returned
+  True, and the pane still showed its text. Whether the image lands at the right cell on a real terminal is not
+  observed here (no client attached).
 
 ### 2026-11-22 15:41  #FROM:a probe run by the author: iTerm2 3.7.7 on a Mac, over ssh to another Mac, tmux 3.8
 
