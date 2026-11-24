@@ -1,8 +1,9 @@
 # my-term
 
-One Python module, `my_term.py`, for **terminal detection**, **images pasted or shown**, and **interactive key
-prompts** -- for iTerm2 on macOS and Secure ShellFish on iOS and iPadOS, directly or inside tmux, over ssh or not.
-A tool asks it by capability and never looks at a terminal itself, so a new terminal changes this file alone.
+One Python module, `my_term.py`, for **terminal detection**, **images pasted or shown**, **interactive key
+prompts** and **the window's width** -- for iTerm2 on macOS and Secure ShellFish on iOS and iPadOS, directly or
+inside tmux, over ssh or not. A tool asks it by capability and never looks at a terminal itself, so a new terminal
+changes this file alone.
 
 Standard library only, Python 3.9 or newer, macOS or Linux (it uses `termios`).
 
@@ -23,6 +24,9 @@ if got and got.how == "elsewhere":
 prompt = my_term.Prompt(("y", "n", "C", "r"), {"r": "run"})
 key = prompt.read()              # [y]es [n]o [C]ancel [r]un: ; no Enter
 
+if not my_term.widen(term, 100):
+    sys.exit("needs a window 100 columns wide")   # the caller's own words
+
 print("\n" * 9)                # the text first, 10 rows kept free for the image
 if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
     print(png_path)              # cannot be drawn here: name the file
@@ -38,22 +42,37 @@ if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
   Directly it asks the terminal with CSI 16 t; inside tmux it reads the window's cell dimensions. Call it again
   after a resize. It waits at most 200 ms for a direct answer and does not require tmux passthrough.
 - **`Prompt(keys, labels=None, fd_in=0, fd_out=1)`** draws a key line and reads one of the offered keys with
-  `read(wait=0, draw=True)`. The shared labels are `y` yes, `n` no, `o` ok, `w` write, `?` unclear, `s` skip,
-  `@` later or agent, `u` undo, `e` edit, `v` view, `c` cycle, `C` cancel, `Q` quit and `A` apply. Supply a
-  label for each other key; a label overriding a shared key or naming an unoffered key raises `ValueError`.
+  `read(wait=0, draw=True)`. A key is one character; the keys that type none are `KEY_ESC` ⎋, `KEY_RETURN` ↩,
+  `KEY_PGUP` ⇞, `KEY_PGDN` ⇟, `KEY_HOME` ↖, `KEY_END` ↘ and the arrows ↑ ↓ → ← -- the Mac's signs for them,
+  drawn so (`[⎋] back`). The shared labels are `y` yes, `n` no, `o` ok, `w` write, `?` unclear, `s` skip,
+  `@` later or agent, `u` undo, `e` edit, `v` view, `c` cycle, `C` cancel, `Q` quit, `A` apply and ⎋ back.
+  Supply a label for each other key; a label overriding a shared key or naming an unoffered key raises
+  `ValueError`. Keys given the same label are drawn as one group: `[B D E] folder`, `[1-3] as similar`,
+  `[a-z 1-9] Quick Look` (three or more consecutive keys as a range).
   Unoffered input rings the bell and is refused. `read` returns `None` after `wait` seconds (zero waits without
   a timeout); `draw=False` continues a timed wait without repeating the line. `draw()` draws it separately,
   before other output such as an image; follow it with `read(draw=False)`. Reuse the prompt across waits:
-  split UTF-8 and arrow sequences stay pending. Ctrl-C raises `KeyboardInterrupt`, EOF raises `EOFError`, and
-  the terminal mode is restored. `discard()` clears typed-ahead input before a new question; reads otherwise
-  keep it, so a key followed by text leaves that text for the caller. When `v` is offered, space returns `v`;
-  without `v`, space can be offered as its own key. `read(resized=callback)` returns `KEY_RESIZED` when the
-  callback consumes a resize notification, within 100 ms. `read(refused=callback)` passes an unoffered key to
-  the callback instead of ringing the bell; the callback can report it and redraw. The caller handles what each
-  accepted key does.
+  split UTF-8 and arrow sequences stay pending. Esc alone is ⎋ when nothing follows it within 50 ms. Ctrl-C
+  raises `KeyboardInterrupt`; Ctrl-D and the end of the input raise `EOFError`; the terminal mode is restored.
+  Input that is no terminal (a pipe, a file: a tool's tests) gives one key per line, the line's first
+  character -- an empty line ↩ -- and `discard()` keeps its lines. `discard()` clears typed-ahead input on a
+  terminal before a new question; reads otherwise keep it, so a key followed by text leaves that text for the
+  caller, and keys typed while my_term asks the terminal something (the cursor for `show()`) are read next.
+  When `v` is offered with its shared label, space returns `v`; otherwise space can be offered as its own key.
+  `read(resized=callback)` returns `KEY_RESIZED` when the callback consumes a resize notification, within 100
+  ms. `read(refused=callback)` passes an unoffered key to the callback instead of ringing the bell; the
+  callback can report it and redraw. The caller handles what each accepted key does.
+- `Prompt(..., submenu=True)`: a prompt entered from another (my-docs sort's `e`) offers its keys and ⎋ (back to
+  the one above) and nothing else, so its labels may name house keys: `[c]ountry [y] type [n]ame [⎋] back`.
 - `Prompt(..., mark={"y": "✅ (recommended)"})` adds a mark after the shared label; `quiet="g"` accepts an
-  offered key without drawing it. `style="2"` dims the line; `wrap_before="@"` breaks before that visible key
-  when the line exceeds the terminal width. `width=<columns>` supplies a width instead of reading the terminal.
+  offered key without drawing it. `style="2"` dims the line. A line wider than the terminal -- or
+  `width=<columns>` -- is broken between keys, before `wrap_before="@"` first; `indent=<columns>` starts every
+  row after the first that far in (a column beside a page). `fd_out=2` draws on stderr.
+- **`widen(term, cols)` -> `bool`**: the window made at least `cols` columns wide when it is narrower, and left so;
+  `True` when it now is. It asks with xterm's window operation `CSI 8 ; ; <cols> t` (rows kept), inside tmux
+  through passthrough, the window widened by what the pane lacks, and watches the size for up to 1 s. A terminal
+  that does not obey, tmux without passthrough, or no terminal: `False` -- the caller says what it needed. Which
+  terminals obey: not yet tried (`python3 my_term.py widen 120` answers it in one).
 - **`image_from(text, keep_dir)` -> `Pasted | None`**: a path naming a readable image file here is that file
   (ShellFish uploads a pasted image and types its path; a file dragged in); an absolute image path that is not here
   is `elsewhere` (iTerm2's "Save to Temp File and Paste Path" over ssh types a path on the Mac), with the hint to
@@ -82,11 +101,13 @@ One protocol, kitty's: both terminals draw it, and only it passes tmux. iTerm2's
 ## From a shell
 
 ```
-usage: my_term.py [-h] [--version] [--run-tests [<filter>]] [kind | show <PNG>]
+usage: my_term.py [-h] [--version] [--run-tests [<filter>]] [kind | show <PNG> | widen <COLUMNS>]
 ```
 
 - `python3 my_term.py kind` -- the terminal, what named it, whether images are drawn.
 - `python3 my_term.py show <PNG>` -- draws it 20 cells wide, or says why not.
+- `python3 my_term.py widen <COLUMNS>` -- asks the terminal for a window that wide: `widen 120: 120 columns
+  (was 90) -- fits`, rc 0; rc 1 when it stays narrower.
 - `python3 my_term.py --run-tests [<filter>]` -- its tests, TAP (`1..N`, then `ok K - title` per test), those whose
   title holds the filter. A terminal is faked on a pty, tmux by a stand-in: no real terminal is needed.
 - `python3 my_term.py --version` -- the version, git's describe when run in its own checkout, and the build (the
