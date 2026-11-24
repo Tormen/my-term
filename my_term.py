@@ -16,6 +16,7 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import io
 import os
 import re
 import select
@@ -32,7 +33,7 @@ import time
 import traceback
 import unicodedata
 from dataclasses import dataclass
-from typing import Callable, Final, Literal, Mapping, Sequence
+from typing import Callable, Final, Literal, Mapping, Sequence, TextIO
 
 VERSION: Final = "1.0"
 NAME: Final = "my_term"
@@ -274,10 +275,15 @@ class Prompt:
     across timed reads so an incomplete escape or UTF-8 character remains
     pending. Ctrl-C raises KeyboardInterrupt; Ctrl-D and the end of the
     input raise EOFError.
+
+    It reads STDIN and draws on STDOUT, text streams -- sys.stdin and
+    sys.stdout as they are at each call, unless given -- so the key line
+    lands in order with the tool's own lines on that stream, and a stream a
+    test put in their place (io.StringIO) is read and written like any.
     """
 
     def __init__(self, keys: Sequence[str], labels: Mapping[str, str] | None = None,
-                 fd_in: int = 0, fd_out: int = 1, *, mark: Mapping[str, str] | None = None,
+                 stdin: TextIO | None = None, stdout: TextIO | None = None, *, mark: Mapping[str, str] | None = None,
                  quiet: Sequence[str] = (), style: str = "", width: int | None = None,
                  wrap_before: str = "", indent: int = 0, submenu: bool = False) -> None:
         extra = {} if labels is None else dict(labels)
@@ -328,8 +334,14 @@ class Prompt:
                 text += (" (space)" if k == "v" and self.space_is_view else "") + (" " + marks[k] if k in marks else "")
                 self.parts.append((frozenset(group), text))
         self.style, self.width, self.wrap_before, self.indent = style, width, wrap_before, indent
-        self.fd_in, self.fd_out = fd_in, fd_out
+        self.stdin, self.stdout = stdin, stdout
         self.pending = bytearray()
+
+    def _in(self) -> TextIO:
+        return sys.stdin if self.stdin is None else self.stdin
+
+    def _out(self) -> TextIO:
+        return sys.stdout if self.stdout is None else self.stdout
 
     @staticmethod
     def _label(key: str, label: str) -> str:
@@ -342,8 +354,8 @@ class Prompt:
         between keys -- before WRAP_BEFORE first -- and every row after the
         first starts INDENT columns in."""
         try:
-            width = self.width or os.get_terminal_size(self.fd_out).columns or 80   # 0: a size nobody set
-        except OSError:
+            width = self.width or os.get_terminal_size(self._out().fileno()).columns or 80   # 0: a size nobody set
+        except (OSError, ValueError):                                   # ValueError: a stream with no fd
             width = 80
         whole = " ".join(text for _, text in self.parts) + ": "
         rows: list[str] = []
@@ -363,15 +375,16 @@ class Prompt:
         line = ("\n" + " " * self.indent).join(rows)
         if self.style:
             line = f"\x1b[{self.style}m{line}\x1b[0m"
-        os.write(self.fd_out, line.encode("utf-8"))
+        self._out().write(line)
+        self._out().flush()
 
     def discard(self) -> None:
         """Discard typed-ahead input before showing a new question. Input
         that is no terminal keeps its lines: they are the answers."""
-        if os.isatty(self.fd_in):
+        if self._in().isatty():
             self.pending.clear()
             TYPED_AHEAD.clear()
-            termios.tcflush(self.fd_in, termios.TCIFLUSH)
+            termios.tcflush(self._in().fileno(), termios.TCIFLUSH)
 
     def _byte(self, wait: float | None) -> bytes | None:
         """The next byte of input: what a question to the terminal left
@@ -381,9 +394,10 @@ class Prompt:
             byte = bytes(TYPED_AHEAD[:1])
             del TYPED_AHEAD[:1]
             return byte
-        if not select.select([self.fd_in], [], [], wait)[0]:
+        fd = self._in().fileno()
+        if not select.select([fd], [], [], wait)[0]:
             return None
-        return os.read(self.fd_in, 1)
+        return os.read(fd, 1)
 
     def _key(self, byte: bytes) -> tuple[str, str] | None:
         """BYTE from a terminal added to what is pending: the key it
@@ -422,18 +436,14 @@ class Prompt:
         self.pending.clear()
         return key, said
 
-    def _line_key(self, byte: bytes) -> tuple[str, str] | None:
-        """BYTE from input that is no terminal: at a line's end its first
-        character is the key -- an empty line KEY_RETURN, ESC KEY_ESC -- with
-        the line; None within a line. The end of the input ends a last line
-        without a newline; with nothing left it raises EOFError."""
-        if not byte and not self.pending:
+    def _line(self) -> tuple[str, str]:
+        """The next line of input that is no terminal: its first character
+        as the key -- an empty line KEY_RETURN, ESC KEY_ESC -- and the line.
+        At the end of the input EOFError."""
+        line = self._in().readline()
+        if not line:
             raise EOFError("input closed")
-        if byte and byte != b"\n":
-            self.pending.extend(byte)
-            return None
-        line = self.pending.decode("utf-8", "replace").rstrip("\r")
-        self.pending.clear()
+        line = line.rstrip("\n").rstrip("\r")
         first = line[:1]
         return {"": KEY_RETURN, "\x1b": KEY_ESC}.get(first, first), line
 
@@ -444,19 +454,21 @@ class Prompt:
         WAIT zero waits indefinitely; DRAW false continues a timed wait
         without repeating the line. RESIZED consumes resize notifications;
         REFUSED receives each unoffered key, or it rings the bell. Input
-        that is no terminal (a pipe, a file) gives a key per line: the
-        line's first character. The terminal mode is restored on every
-        return or exception.
+        that is no terminal (a pipe, a file, a StringIO) gives a key per
+        line, the line's first character; there a read waits for a line,
+        whatever WAIT says. The terminal mode is restored on every return
+        or exception.
         """
         if wait < 0:
             raise ValueError("wait must not be negative")
-        tty = os.isatty(self.fd_in)
-        saved = termios.tcgetattr(self.fd_in) if tty else None
+        tty = self._in().isatty()
+        fd = self._in().fileno() if tty else -1
+        saved = termios.tcgetattr(fd) if tty else None
         if saved is not None:
-            raw = termios.tcgetattr(self.fd_in)
+            raw = termios.tcgetattr(fd)
             raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
             raw[6][termios.VMIN], raw[6][termios.VTIME] = 1, 0
-            termios.tcsetattr(self.fd_in, termios.TCSANOW, raw)
+            termios.tcsetattr(fd, termios.TCSANOW, raw)
         try:
             if draw:
                 self.draw()
@@ -464,29 +476,33 @@ class Prompt:
             while True:
                 if resized is not None and resized():
                     return KEY_RESIZED
-                left = max(0.0, end - time.monotonic()) if wait else None
-                if resized is not None:
-                    left = min(left, 0.1) if left is not None else 0.1
-                byte = self._byte(left)
-                if byte is None:
-                    if resized is not None and (not wait or time.monotonic() < end):
+                if not tty:
+                    got = self._line()
+                else:
+                    left = max(0.0, end - time.monotonic()) if wait else None
+                    if resized is not None:
+                        left = min(left, 0.1) if left is not None else 0.1
+                    byte = self._byte(left)
+                    if byte is None:
+                        if resized is not None and (not wait or time.monotonic() < end):
+                            continue
+                        return None
+                    got = self._key(byte)
+                    if got is None:
                         continue
-                    return None
-                got = self._key(byte) if tty else self._line_key(byte)
-                if got is None:
-                    continue
                 key, said = got
                 if key == " " and self.space_is_view:
                     return "v"
                 if key in self.keys:
                     return key
                 if refused is None:
-                    os.write(self.fd_out, b"\a")
+                    self._out().write("\a")
+                    self._out().flush()
                 else:
                     refused(key or said)
         finally:
             if saved is not None:
-                termios.tcsetattr(self.fd_in, termios.TCSADRAIN, saved)
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 # -------------------------------------------------------------------------
@@ -831,6 +847,11 @@ class FakeTerminal:
                     if a:
                         os.write(self.master, a.pop(0))
 
+    def streams(self) -> tuple[TextIO, TextIO]:
+        """Text streams on the slave, as a tool's sys.stdin and sys.stdout are on a terminal."""
+        return (open(self.slave, encoding="utf-8", closefd=False),
+                open(self.slave, "w", encoding="utf-8", closefd=False))
+
     def close(self) -> bytes:
         time.sleep(0.05)
         self.done.set()
@@ -888,7 +909,7 @@ def t_prompt(t: T) -> None:
     raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
     termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
     try:
-        prompt = Prompt(("y", "n", "C", "r"), {"r": "run"}, fake.slave, fake.slave)
+        prompt = Prompt(("y", "n", "C", "r"), {"r": "run"}, *fake.streams())
         os.write(fake.master, b"xyC")
         first = prompt.read(wait=1)
         second = prompt.read(wait=1)
@@ -921,7 +942,7 @@ def t_prompt_walk(t: T) -> None:
     termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
     rejected: list[str] = []
     try:
-        prompt = Prompt(("y", "@", "g"), {"g": "go"}, fake.slave, fake.slave,
+        prompt = Prompt(("y", "@", "g"), {"g": "go"}, *fake.streams(),
                         mark={"y": "✅ (recommended)"}, quiet="g", style="2", width=20, wrap_before="@")
         os.write(fake.master, b"xg")
         got = prompt.read(wait=1, refused=rejected.append)
@@ -932,14 +953,9 @@ def t_prompt_walk(t: T) -> None:
             repr(shown))
     t.check("quiet key accepted and not shown", got == "g" and "[g]" not in shown, repr(got))
     t.check("refused key passed to callback", rejected == ["x"], repr(rejected))
-    r, w = os.pipe()
-    try:
-        Prompt(("y", "@"), fd_out=w, width=80, wrap_before="@").draw()
-        wide = os.read(r, 200)
-    finally:
-        os.close(r)
-        os.close(w)
-    t.check("wide terminal keeps one line", wide == b"[y]es [@] later or agent: ", repr(wide))
+    out = io.StringIO()
+    Prompt(("y", "@"), stdout=out, width=80, wrap_before="@").draw()
+    t.check("wide terminal keeps one line", out.getvalue() == "[y]es [@] later or agent: ", repr(out.getvalue()))
     bad: Sequence[Callable[[], Prompt]] = (lambda: Prompt(("y",), mark={"x": "unexpected"}),
                                            lambda: Prompt(("y",), quiet="x"),
                                            lambda: Prompt(("y",), style="2m"),
@@ -959,17 +975,17 @@ def t_prompt_controls(t: T) -> None:
     raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
     termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
     try:
-        view = Prompt(("v", "y"), fd_in=fake.slave, fd_out=fake.slave)
+        view = Prompt(("v", "y"), None, *fake.streams())
         os.write(fake.master, b" ")
         alias = view.read(wait=1)
         os.write(fake.master, b"yy")
         view.discard()
         discarded = view.read(wait=0.05)
         resized = view.read(wait=1, resized=lambda: True)
-        space = Prompt((" ",), {" ": "preview"}, fake.slave, fake.slave)
+        space = Prompt((" ",), {" ": "preview"}, *fake.streams())
         os.write(fake.master, b" ")
         own = space.read(wait=1)
-        no_view = Prompt(("y",), fd_in=fake.slave, fd_out=fake.slave)
+        no_view = Prompt(("y",), None, *fake.streams())
         os.write(fake.master, b" y")
         refused = no_view.read(wait=1)
         notice = threading.Event()
@@ -977,7 +993,7 @@ def t_prompt_controls(t: T) -> None:
         timer.start()
         delayed = no_view.read(wait=1, resized=notice.is_set)
         timer.join()
-        write = Prompt(("w",), fd_in=fake.slave, fd_out=fake.slave)
+        write = Prompt(("w",), None, *fake.streams())
         os.write(fake.master, b"whello\n")
         selected = write.read(wait=1)
         text_after_key = os.read(fake.slave, 6)
@@ -1000,7 +1016,7 @@ def t_prompt_fragments(t: T) -> None:
     termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
     before_mode = termios.tcgetattr(fake.slave)
     try:
-        p = Prompt(("y", "→"), {"→": "next"}, fake.slave, fake.slave)
+        p = Prompt(("y", "→"), {"→": "next"}, *fake.streams())
         os.write(fake.master, b"\x1b[")
         before = p.read(wait=0.05)
         os.write(fake.master, b"Cy")
@@ -1033,7 +1049,7 @@ def t_prompt_keys(t: T) -> None:
     try:
         p = Prompt((KEY_ESC, KEY_RETURN, KEY_PGUP, KEY_PGDN, KEY_HOME, KEY_END, "↑", "C"),
                    {KEY_RETURN: "keep", KEY_PGUP: "page up", KEY_PGDN: "page down", KEY_HOME: "first",
-                    KEY_END: "last", "↑": "up"}, fake.slave, fake.slave)
+                    KEY_END: "last", "↑": "up"}, *fake.streams())
         os.write(fake.master, b"\x1b")
         got.append(p.read(wait=1))
         os.write(fake.master, b"\x1b[AC\r\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOH\x1b[4~")
@@ -1056,47 +1072,57 @@ def t_prompt_keys(t: T) -> None:
 
 
 def t_prompt_pipe(t: T) -> None:
-    r, w = os.pipe()
-    out_r, out_w = os.pipe()
+    out = io.StringIO()
     rejected: list[str] = []
+    p = Prompt(("y", KEY_RETURN, KEY_ESC, "C"), {KEY_RETURN: "keep"}, io.StringIO("yes\n\nxz\n\x1b\nC"), out)
+    p.discard()
+    got = [p.read(refused=rejected.append) for _ in range(4)]
     try:
-        os.write(w, b"yes\n\nxz\n\x1b\nC")
-        os.close(w)
-        p = Prompt(("y", KEY_RETURN, KEY_ESC, "C"), {KEY_RETURN: "keep"}, r, out_w)
-        p.discard()
-        got = [p.read(refused=rejected.append) for _ in range(4)]
-        try:
-            p.read()
-            eof = False
-        except EOFError:
-            eof = True
-        drawn = os.read(out_r, 4096)
-    finally:
-        os.close(r)
-        os.close(out_r)
-        os.close(out_w)
+        p.read()
+        eof = False
+    except EOFError:
+        eof = True
     t.check("a line's first character; an empty line Return; ESC Esc; a last line without newline",
             got == ["y", KEY_RETURN, KEY_ESC, "C"], repr(got))
     t.check("an unoffered line refused, discard keeps the lines", rejected == ["x"], repr(rejected))
     t.check("the end of the input raises EOFError", eof)
-    t.check("the line is drawn for each read", drawn.count(b"[y]es") == 5, repr(drawn))
+    t.check("the line is drawn for each read", out.getvalue().count("[y]es") == 5, repr(out.getvalue()))
+    r, w = os.pipe()
+    try:
+        os.write(w, b"C\n")
+        os.close(w)
+        with open(r, encoding="utf-8", closefd=False) as piped:
+            from_pipe = Prompt(("C",), None, piped, io.StringIO()).read()
+    finally:
+        os.close(r)
+    t.check("a pipe read the same way", from_pipe == "C", repr(from_pipe))
+
+
+def t_prompt_streams(t: T) -> None:
+    was = sys.stdin, sys.stdout
+    try:
+        p = Prompt(("y", "n"))                       # sys.stdin and sys.stdout as they are when it reads
+        sys.stdin, sys.stdout = io.StringIO("n\n"), io.StringIO()
+        print("delete the 3 copies?", end=" ")
+        got = p.read()
+        shown = sys.stdout.getvalue()
+    finally:
+        sys.stdin, sys.stdout = was
+    t.check("keys from the sys.stdin a test put in place", got == "n", repr(got))
+    t.check("the key line after the tool's own text on the same stream",
+            shown == "delete the 3 copies? [y]es [n]o: ", repr(shown))
 
 
 def t_prompt_groups(t: T) -> None:
-    r, w = os.pipe()
-    try:
-        Prompt(("B", "D", "E", "1", "2", "3", "s"), {"B": "folder", "D": "folder", "E": "folder", "1": "as similar",
-               "2": "as similar", "3": "as similar"}, fd_out=w, width=100).draw()
-        alike = os.read(r, 200)
-        look = "abcdefghijklmnopqrstuvwxyz123456789"
-        Prompt(tuple(look), dict.fromkeys(look, "Quick Look"), fd_out=w, width=100, submenu=True).draw()
-        letters = os.read(r, 200)
-    finally:
-        os.close(r)
-        os.close(w)
-    t.check("one label for keys apart and for a range", alike == b"[B D E] folder [1-3] as similar [s]kip: ",
-            repr(alike))
-    t.check("letters and digits as two ranges", letters == b"[a-z 1-9] Quick Look [\xe2\x8e\x8b] back: ", repr(letters))
+    alike, letters = io.StringIO(), io.StringIO()
+    Prompt(("B", "D", "E", "1", "2", "3", "s"), {"B": "folder", "D": "folder", "E": "folder", "1": "as similar",
+           "2": "as similar", "3": "as similar"}, stdout=alike, width=100).draw()
+    look = "abcdefghijklmnopqrstuvwxyz123456789"
+    Prompt(tuple(look), dict.fromkeys(look, "Quick Look"), stdout=letters, width=100, submenu=True).draw()
+    t.check("one label for keys apart and for a range",
+            alike.getvalue() == "[B D E] folder [1-3] as similar [s]kip: ", repr(alike.getvalue()))
+    t.check("letters and digits as two ranges", letters.getvalue() == "[a-z 1-9] Quick Look [⎋] back: ",
+            repr(letters.getvalue()))
     try:
         Prompt(("1", "2"), {"1": "x", "2": "x"}, mark={"1": "!"})
         t.check("a mark on a grouped key refused", False)
@@ -1105,22 +1131,17 @@ def t_prompt_groups(t: T) -> None:
 
 
 def t_prompt_indent(t: T) -> None:
-    r, w = os.pipe()
-    try:
-        Prompt(("y", "n", "s", "u", "Q"), fd_out=w, width=16, indent=4).draw()
-        wrapped = os.read(r, 200)
-    finally:
-        os.close(r)
-        os.close(w)
+    out = io.StringIO()
+    Prompt(("y", "n", "s", "u", "Q"), stdout=out, width=16, indent=4).draw()
     t.check("broken between keys, each row after the first indented, none wider than the width",
-            wrapped == b"[y]es [n]o\n    [s]kip\n    [u]ndo\n    [Q] quit: ", repr(wrapped))
+            out.getvalue() == "[y]es [n]o\n    [s]kip\n    [u]ndo\n    [Q] quit: ", repr(out.getvalue()))
 
 
 def t_prompt_submenu(t: T) -> None:
     fake, saved = raw_pty()
     try:
         p = Prompt(("f", "c", "y", "n"), {"f": "folder", "c": "country", "y": "type", "n": "name"},
-                   fake.slave, fake.slave, submenu=True)
+                   *fake.streams(), submenu=True)
         os.write(fake.master, b"Qn")
         name = p.read(wait=1)
         os.write(fake.master, b"\x1b")
@@ -1147,7 +1168,7 @@ def t_typed_ahead(t: T) -> None:
         time.sleep(0.05)
         at = cursor(fake.slave, fake.slave)
         os.write(fake.master, b"C")
-        p = Prompt(("→", "C"), {"→": "next"}, fake.slave, fake.slave)
+        p = Prompt(("→", "C"), {"→": "next"}, *fake.streams())
         key = p.read(wait=1)
     finally:
         termios.tcsetattr(fake.slave, termios.TCSANOW, saved)
@@ -1430,6 +1451,7 @@ TESTS: Final[Sequence[tuple[str, Callable[[T], None]]]] = (
     ("prompt: split input and terminal mode", t_prompt_fragments),
     ("prompt: Esc, Return, Ctrl-D, page keys", t_prompt_keys),
     ("prompt: input that is no terminal, a key per line", t_prompt_pipe),
+    ("prompt: sys.stdin and sys.stdout as text streams, replaced by a test", t_prompt_streams),
     ("prompt: one label for a group of keys", t_prompt_groups),
     ("prompt: a wrapped line indented", t_prompt_indent),
     ("prompt: a submenu offers its keys and Esc", t_prompt_submenu),

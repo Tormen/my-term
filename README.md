@@ -41,8 +41,11 @@ if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
 - **`cell_size()` -> `tuple[int, int] | None`**: the cell's height and width in pixels, or `None` when unknown.
   Directly it asks the terminal with CSI 16 t; inside tmux it reads the window's cell dimensions. Call it again
   after a resize. It waits at most 200 ms for a direct answer and does not require tmux passthrough.
-- **`Prompt(keys, labels=None, fd_in=0, fd_out=1)`** draws a key line and reads one of the offered keys with
-  `read(wait=0, draw=True)`. A key is one character; the keys that type none are `KEY_ESC` ⎋, `KEY_RETURN` ↩,
+- **`Prompt(keys, labels=None, stdin=None, stdout=None)`** draws a key line and reads one of the offered keys with
+  `read(wait=0, draw=True)`. It reads `stdin` and writes `stdout`, text streams -- `sys.stdin` and `sys.stdout`
+  as they are at each call, unless given -- so the line lands in order with the tool's own `print()`s, and a
+  stream a test puts in their place (`io.StringIO`) is read and written like any; `stdout=sys.stderr` draws on
+  stderr. A key is one character; the keys that type none are `KEY_ESC` ⎋, `KEY_RETURN` ↩,
   `KEY_PGUP` ⇞, `KEY_PGDN` ⇟, `KEY_HOME` ↖, `KEY_END` ↘ and the arrows ↑ ↓ → ← -- the Mac's signs for them,
   drawn so (`[⎋] back`). The shared labels are `y` yes, `n` no, `o` ok, `w` write, `?` unclear, `s` skip,
   `@` later or agent, `u` undo, `e` edit, `v` view, `c` cycle, `C` cancel, `Q` quit, `A` apply and ⎋ back.
@@ -54,8 +57,9 @@ if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
   before other output such as an image; follow it with `read(draw=False)`. Reuse the prompt across waits:
   split UTF-8 and arrow sequences stay pending. Esc alone is ⎋ when nothing follows it within 50 ms. Ctrl-C
   raises `KeyboardInterrupt`; Ctrl-D and the end of the input raise `EOFError`; the terminal mode is restored.
-  Input that is no terminal (a pipe, a file: a tool's tests) gives one key per line, the line's first
-  character -- an empty line ↩ -- and `discard()` keeps its lines. `discard()` clears typed-ahead input on a
+  Input that is no terminal (a pipe, a file, a `StringIO`: a tool's tests) gives one key per line, the line's
+  first character -- an empty line ↩ -- read with `readline()`, waiting for a line whatever `wait` says;
+  `discard()` keeps its lines. `discard()` clears typed-ahead input on a
   terminal before a new question; reads otherwise keep it, so a key followed by text leaves that text for the
   caller, and keys typed while my_term asks the terminal something (the cursor for `show()`) are read next.
   When `v` is offered with its shared label, space returns `v`; otherwise space can be offered as its own key.
@@ -67,7 +71,7 @@ if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
 - `Prompt(..., mark={"y": "✅ (recommended)"})` adds a mark after the shared label; `quiet="g"` accepts an
   offered key without drawing it. `style="2"` dims the line. A line wider than the terminal -- or
   `width=<columns>` -- is broken between keys, before `wrap_before="@"` first; `indent=<columns>` starts every
-  row after the first that far in (a column beside a page). `fd_out=2` draws on stderr.
+  row after the first that far in (a column beside a page).
 - **`widen(term, cols)` -> `bool`**: the window made at least `cols` columns wide when it is narrower, and left so;
   `True` when it now is. It asks with xterm's window operation `CSI 8 ; ; <cols> t` (rows kept), inside tmux
   through passthrough, the window widened by what the pane lacks, and watches the size for up to 1 s. A terminal
