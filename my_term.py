@@ -29,6 +29,7 @@ import termios
 import threading
 import time
 import traceback
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Final, Literal, Mapping, Sequence
 
@@ -45,6 +46,8 @@ DSR: Final = b"\x1b[6n"                 # "where is the cursor?" -- answered ESC
 XTVERSION_ANSWER: Final = re.compile(rb"\x1bP>\|([^\x1b]*)\x1b\\")
 DA1_ANSWER: Final = re.compile(rb"\x1b\[\?[0-9;]*c")
 DSR_ANSWER: Final = re.compile(rb"\x1b\[([0-9]+);([0-9]+)R")
+CELL_SIZE_ANSWER: Final = re.compile(rb"\x1b\[6;([0-9]+);([0-9]+)t")
+TMUX_CELL_SIZE: Final = "#{window_cell_height}\t#{window_cell_width}"
 TMUX_WHO: Final = "#{client_termtype}\t#{allow-passthrough}"
 TMUX_WHERE: Final = "#{pane_top}\t#{pane_left}\t#{status}\t#{status-position}"
 # the terminals seen to draw an image sent through tmux's passthrough (iTerm2 3.7.7, tmux 3.8); ShellFish's own
@@ -177,6 +180,181 @@ def detect(env: Mapping[str, str] | None = None, fd_in: int = 0, fd_out: int = 1
     m = XTVERSION_ANSWER.search(ask(XTVERSION + DA1, DA1_ANSWER, fd_in, fd_out))
     answer = m.group(1).decode("utf-8", "replace") if m else ""
     return Terminal(kind_of(answer), answer, False, False, True)
+
+
+def cell_size(env: Mapping[str, str] | None = None, fd_in: int = 0, fd_out: int = 1,
+              run: Run = run_cmd) -> tuple[int, int] | None:
+    """Cell height and width in pixels, or None when unknown.
+
+    tmux's window reports its cell dimensions; directly, CSI 16 t asks the
+    terminal, with DA1 ending the wait when the terminal does not answer."""
+    env = os.environ if env is None else env
+    if not (os.isatty(fd_in) and os.isatty(fd_out)):
+        return None
+    if env.get("TMUX"):
+        try:
+            parts = run(["tmux", "display-message", "-p", TMUX_CELL_SIZE]).strip().split("\t")
+            if len(parts) != 2:
+                return None
+            height, width = (int(part) for part in parts)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+    else:
+        match = CELL_SIZE_ANSWER.search(ask(b"\x1b[16t" + DA1, DA1_ANSWER, fd_in, fd_out))
+        if match is None:
+            return None
+        height, width = int(match.group(1)), int(match.group(2))
+    return (height, width) if height > 0 and width > 0 else None
+
+
+# -------------------------------------------------------------------------
+# a prompt's key line and input
+# -------------------------------------------------------------------------
+
+KEY_LABELS: Final[Mapping[str, str]] = {
+    "y": "yes", "n": "no", "o": "ok", "w": "write", "?": "unclear",
+    "s": "skip", "@": "later or agent", "u": "undo", "e": "edit",
+    "v": "view", "c": "cycle", "C": "cancel", "Q": "quit", "A": "apply",
+}
+KEY_RESIZED: Final = "\x00resize"
+
+
+class Prompt:
+    """A key line and its input: only the offered keys are returned.
+
+    LABELS names additional keys, never a key in KEY_LABELS. Reuse the
+    prompt across timed reads so an incomplete escape or UTF-8 character
+    remains pending. Ctrl-C raises KeyboardInterrupt; EOF raises EOFError.
+    """
+
+    def __init__(self, keys: Sequence[str], labels: Mapping[str, str] | None = None,
+                 fd_in: int = 0, fd_out: int = 1, *, mark: Mapping[str, str] | None = None,
+                 quiet: Sequence[str] = (), style: str = "", width: int | None = None,
+                 wrap_before: str = "") -> None:
+        extra = {} if labels is None else dict(labels)
+        marks = {} if mark is None else dict(mark)
+        if not keys or len(set(keys)) != len(keys):
+            raise ValueError("keys must be nonempty and unique")
+        if "v" in keys and " " in keys:
+            raise ValueError("space is already the alias for view")
+        if any(len(k) != 1 or not k.isprintable() for k in keys):
+            raise ValueError("each key must be one printable character")
+        if set(extra) & set(KEY_LABELS) or set(extra) - set(keys):
+            raise ValueError("labels may name only offered keys outside the shared table")
+        if any(not label or not label.isprintable() for label in extra.values()):
+            raise ValueError("labels must be printable and nonempty")
+        if any(k not in KEY_LABELS and k not in extra for k in keys):
+            raise ValueError("each key needs a shared or caller label")
+        if set(quiet) - set(keys) or set(marks) - (set(keys) - set(quiet)):
+            raise ValueError("quiet keys must be offered and marks must name visible keys")
+        if any(not text or not text.isprintable() for text in marks.values()):
+            raise ValueError("marks must be printable and nonempty")
+        if wrap_before and (wrap_before not in keys or wrap_before in quiet):
+            raise ValueError("wrap_before must name a visible key")
+        if width is not None and width < 1:
+            raise ValueError("width must be positive")
+        if style and re.fullmatch(r"[0-9]+(?:;[0-9]+)*", style) is None:
+            raise ValueError("style must be SGR numbers")
+        self.keys = frozenset(keys)
+        self.parts = [(k, self._label(k, KEY_LABELS[k] if k in KEY_LABELS else extra[k])
+                       + (" (space)" if k == "v" else "") + (" " + marks[k] if k in marks else ""))
+                      for k in keys if k not in quiet]
+        self.style, self.width, self.wrap_before = style, width, wrap_before
+        self.fd_in, self.fd_out = fd_in, fd_out
+        self.pending = bytearray()
+
+    @staticmethod
+    def _label(key: str, label: str) -> str:
+        return f"[{key}]{label[1:]}" if label.startswith(key) else f"[{key}] {label}"
+
+    def draw(self) -> None:
+        """Draw the offered keys; read(draw=False) can follow other output."""
+        line = " ".join(text for _, text in self.parts) + ": "
+        try:
+            width = self.width if self.width is not None else os.get_terminal_size(self.fd_out).columns
+        except OSError:
+            width = 80
+        cells = sum(0 if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf")
+                    else 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in line)
+        if self.wrap_before and cells > width:
+            at = next(i for i, (key, _) in enumerate(self.parts) if key == self.wrap_before)
+            if at:
+                line = " ".join(text for _, text in self.parts[:at]) + "\n" + \
+                       " ".join(text for _, text in self.parts[at:]) + ": "
+        if self.style:
+            line = f"\x1b[{self.style}m{line}\x1b[0m"
+        os.write(self.fd_out, line.encode("utf-8"))
+
+    def discard(self) -> None:
+        """Discard typed-ahead input before showing a new question."""
+        self.pending.clear()
+        termios.tcflush(self.fd_in, termios.TCIFLUSH)
+
+    def read(self, wait: float = 0, draw: bool = True, resized: Callable[[], bool] | None = None,
+             refused: Callable[[str], None] | None = None) -> str | None:
+        """Draw the line and return an offered key, or None after WAIT seconds.
+
+        WAIT zero waits indefinitely; DRAW false continues a timed wait
+        without repeating the line. RESIZED consumes resize notifications;
+        REFUSED receives each unoffered key, or it rings the bell. The
+        terminal mode is restored on every return or exception.
+        """
+        if wait < 0:
+            raise ValueError("wait must not be negative")
+        saved = termios.tcgetattr(self.fd_in)
+        raw = termios.tcgetattr(self.fd_in)
+        raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+        raw[6][termios.VMIN], raw[6][termios.VTIME] = 1, 0
+        termios.tcsetattr(self.fd_in, termios.TCSANOW, raw)
+        try:
+            if draw:
+                self.draw()
+            end = time.monotonic() + wait
+            while True:
+                if resized is not None and resized():
+                    return KEY_RESIZED
+                left = max(0.0, end - time.monotonic()) if wait else None
+                if resized is not None:
+                    left = min(left, 0.1) if left is not None else 0.1
+                if not select.select([self.fd_in], [], [], left)[0]:
+                    if resized is not None and (not wait or time.monotonic() < end):
+                        continue
+                    return None
+                byte = os.read(self.fd_in, 1)
+                if not byte:
+                    raise EOFError("terminal input closed")
+                if byte == b"\x03":
+                    self.pending.clear()
+                    raise KeyboardInterrupt
+                self.pending.extend(byte)
+                if self.pending[0] == 27:
+                    if len(self.pending) == 1:
+                        continue
+                    if self.pending[1] in (ord("["), ord("O")) and (len(self.pending) < 3 or
+                            not 0x40 <= self.pending[-1] <= 0x7e):
+                        continue
+                    arrows = {b"\x1b[A": "↑", b"\x1b[B": "↓", b"\x1b[C": "→", b"\x1b[D": "←",
+                              b"\x1bOA": "↑", b"\x1bOB": "↓", b"\x1bOC": "→", b"\x1bOD": "←"}
+                    key = arrows.get(bytes(self.pending), "")
+                else:
+                    try:
+                        key = self.pending.decode("utf-8")
+                    except UnicodeDecodeError as e:
+                        if e.reason == "unexpected end of data" and len(self.pending) < 4:
+                            continue
+                        key = ""
+                raw_key = bytes(self.pending).decode("utf-8", "replace")
+                self.pending.clear()
+                if key == " " and "v" in self.keys:
+                    return "v"
+                if key in self.keys:
+                    return key
+                if refused is None:
+                    os.write(self.fd_out, b"\a")
+                else:
+                    refused(key or raw_key)
+        finally:
+            termios.tcsetattr(self.fd_in, termios.TCSADRAIN, saved)
 
 
 # -------------------------------------------------------------------------
@@ -491,6 +669,178 @@ def fake_png(w: int = 2, h: int = 1) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", w, h) + b"\x08\x02\0\0\0"
 
 
+def t_cell_size(t: T) -> None:
+    fake = FakeTerminal({b"\x1b[16t": [b"\x1b[6;21;9t"], DA1: [b"\x1b[?1;2c"]})
+    asked: list[Sequence[str]] = []
+
+    def tmux_run(words: Sequence[str]) -> str:
+        asked.append(words)
+        return "21\t9\n"
+
+    try:
+        direct = cell_size({}, fake.slave, fake.slave)
+        tmux = cell_size({"TMUX": "x"}, fake.slave, fake.slave, run=tmux_run)
+        zero = cell_size({"TMUX": "x"}, fake.slave, fake.slave, run=lambda words: "0\t0\n")
+        malformed = cell_size({"TMUX": "x"}, fake.slave, fake.slave, run=lambda words: "oops")
+    finally:
+        fake.close()
+    t.check("direct answer: height and width", direct == (21, 9), repr(direct))
+    t.check("tmux window cell size", tmux == (21, 9), repr(tmux))
+    t.check("tmux is asked for window dimensions", asked == [["tmux", "display-message", "-p", TMUX_CELL_SIZE]],
+            repr(asked))
+    t.check("zero is unknown", zero is None, repr(zero))
+    t.check("invalid is unknown", malformed is None, repr(malformed))
+    silent = FakeTerminal({DA1: [b"\x1b[?1;2c"]})
+    try:
+        unknown = cell_size({}, silent.slave, silent.slave)
+    finally:
+        silent.close()
+    t.check("unsupported query is unknown", unknown is None, repr(unknown))
+    r, w = os.pipe()
+    try:
+        pipe = cell_size({}, r, w)
+    finally:
+        os.close(r)
+        os.close(w)
+    t.check("a pipe is unknown", pipe is None, repr(pipe))
+
+
+def t_prompt(t: T) -> None:
+    fake = FakeTerminal({})
+    saved = termios.tcgetattr(fake.slave)
+    raw = termios.tcgetattr(fake.slave)
+    raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
+    try:
+        prompt = Prompt(("y", "n", "C", "r"), {"r": "run"}, fake.slave, fake.slave)
+        os.write(fake.master, b"xyC")
+        first = prompt.read(wait=1)
+        second = prompt.read(wait=1)
+        timeout = prompt.read(wait=0.05)
+        os.write(fake.master, b"\x03")
+        try:
+            prompt.read(wait=1)
+            interrupted = False
+        except KeyboardInterrupt:
+            interrupted = True
+    finally:
+        termios.tcsetattr(fake.slave, termios.TCSANOW, saved)
+        shown = fake.close()
+    t.check("invalid x refused; y and C kept in order", (first, second) == ("y", "C"), repr((first, second)))
+    t.check("timeout and Ctrl-C", timeout is None and interrupted)
+    t.check("line uses shared and own labels", b"[y]es" in shown and b"[r]un" in shown, repr(shown))
+    for keys, labels in ((('y',), {'y': 'override'}), (('x',), {}), (('x',), {'z': 'other'})):
+        try:
+            Prompt(keys, labels)
+        except ValueError:
+            continue
+        t.check("bad key or override refused", False, repr((keys, labels)))
+
+
+def t_prompt_walk(t: T) -> None:
+    fake = FakeTerminal({})
+    saved = termios.tcgetattr(fake.slave)
+    raw = termios.tcgetattr(fake.slave)
+    raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
+    rejected: list[str] = []
+    try:
+        prompt = Prompt(("y", "@", "g"), {"g": "go"}, fake.slave, fake.slave,
+                        mark={"y": "✅ (recommended)"}, quiet="g", style="2", width=20, wrap_before="@")
+        os.write(fake.master, b"xg")
+        got = prompt.read(wait=1, refused=rejected.append)
+    finally:
+        termios.tcsetattr(fake.slave, termios.TCSANOW, saved)
+        shown = fake.close().decode("utf-8")
+    t.check("mark and wrap before at, dimmed", shown == "\x1b[2m[y]es ✅ (recommended)\r\n[@] later or agent: \x1b[0m",
+            repr(shown))
+    t.check("quiet key accepted and not shown", got == "g" and "[g]" not in shown, repr(got))
+    t.check("refused key passed to callback", rejected == ["x"], repr(rejected))
+    r, w = os.pipe()
+    try:
+        Prompt(("y", "@"), fd_out=w, width=80, wrap_before="@").draw()
+        wide = os.read(r, 200)
+    finally:
+        os.close(r)
+        os.close(w)
+    t.check("wide terminal keeps one line", wide == b"[y]es [@] later or agent: ", repr(wide))
+    bad: Sequence[Callable[[], Prompt]] = (lambda: Prompt(("y",), mark={"x": "unexpected"}),
+                                           lambda: Prompt(("y",), quiet="x"),
+                                           lambda: Prompt(("y",), style="2m"),
+                                           lambda: Prompt(("y",), wrap_before="x"))
+    for create in bad:
+        try:
+            create()
+        except ValueError:
+            continue
+        t.check("invalid prompt option refused", False)
+
+
+def t_prompt_controls(t: T) -> None:
+    fake = FakeTerminal({})
+    saved = termios.tcgetattr(fake.slave)
+    raw = termios.tcgetattr(fake.slave)
+    raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
+    try:
+        view = Prompt(("v", "y"), fd_in=fake.slave, fd_out=fake.slave)
+        os.write(fake.master, b" ")
+        alias = view.read(wait=1)
+        os.write(fake.master, b"yy")
+        view.discard()
+        discarded = view.read(wait=0.05)
+        resized = view.read(wait=1, resized=lambda: True)
+        space = Prompt((" ",), {" ": "preview"}, fake.slave, fake.slave)
+        os.write(fake.master, b" ")
+        own = space.read(wait=1)
+        no_view = Prompt(("y",), fd_in=fake.slave, fd_out=fake.slave)
+        os.write(fake.master, b" y")
+        refused = no_view.read(wait=1)
+        notice = threading.Event()
+        timer = threading.Timer(0.02, notice.set)
+        timer.start()
+        delayed = no_view.read(wait=1, resized=notice.is_set)
+        timer.join()
+        write = Prompt(("w",), fd_in=fake.slave, fd_out=fake.slave)
+        os.write(fake.master, b"whello\n")
+        selected = write.read(wait=1)
+        text_after_key = os.read(fake.slave, 6)
+    finally:
+        termios.tcsetattr(fake.slave, termios.TCSANOW, saved)
+        fake.close()
+    t.check("space aliases view only when offered", alias == "v" and own == " " and refused == "y",
+            repr((alias, own, refused)))
+    t.check("discard removes typed-ahead keys", discarded is None, repr(discarded))
+    t.check("resize is distinct from timeout", resized == delayed == KEY_RESIZED, repr((resized, delayed)))
+    t.check("following text stays for the line editor", (selected, text_after_key) == ("w", b"hello\n"),
+            repr((selected, text_after_key)))
+
+
+def t_prompt_fragments(t: T) -> None:
+    fake = FakeTerminal({})
+    saved = termios.tcgetattr(fake.slave)
+    raw = termios.tcgetattr(fake.slave)
+    raw[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    termios.tcsetattr(fake.slave, termios.TCSANOW, raw)
+    before_mode = termios.tcgetattr(fake.slave)
+    try:
+        p = Prompt(("y", "→"), {"→": "next"}, fake.slave, fake.slave)
+        os.write(fake.master, b"\x1b[")
+        before = p.read(wait=0.05)
+        os.write(fake.master, b"Cy")
+        arrow, yes = p.read(wait=1), p.read(wait=1)
+        os.write(fake.master, b"\x1b[5~y")
+        ignored = p.read(wait=1)
+        restored = termios.tcgetattr(fake.slave) == before_mode
+    finally:
+        termios.tcsetattr(fake.slave, termios.TCSANOW, saved)
+        fake.close()
+    t.check("split arrow survives timeout and preserves the next key", (before, arrow, yes) == (None, "→", "y"),
+            repr((before, arrow, yes)))
+    t.check("unknown escape does not become a key", ignored == "y", repr(ignored))
+    t.check("terminal mode restored", restored)
+
+
 def t_kind_of(t: T) -> None:
     t.check("iTerm2's answer", kind_of("iTerm2 3.7.7") == "iterm2")
     t.check("ShellFish's name", kind_of("Secure ShellFish 2026.35") == "shellfish")
@@ -720,6 +1070,11 @@ def t_guard(t: T) -> None:
 
 
 TESTS: Final[Sequence[tuple[str, Callable[[T], None]]]] = (
+    ("prompt: key line and input", t_prompt),
+    ("prompt: walk marks quiet keys and layout", t_prompt_walk),
+    ("prompt: alias discard and resize", t_prompt_controls),
+    ("prompt: split input and terminal mode", t_prompt_fragments),
+    ("cell size: direct and tmux", t_cell_size),
     ("kind: XTVERSION's answer names the terminal", t_kind_of),
     ("detect: directly, by XTVERSION", t_detect_direct),
     ("detect: a terminal without XTVERSION ends the wait at DA1", t_detect_no_xtversion),

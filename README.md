@@ -1,8 +1,8 @@
 # my-term
 
-One Python module, `my_term.py`, that knows the terminal: **which one it is**, **an image pasted into it**, and **an
-image shown in it** -- for iTerm2 on macOS and Secure ShellFish on iOS and iPadOS, directly or inside tmux, over ssh
-or not. A tool asks it by capability and never looks at a terminal itself, so a new terminal changes this file alone.
+One Python module, `my_term.py`, for **terminal detection**, **images pasted or shown**, and **interactive key
+prompts** -- for iTerm2 on macOS and Secure ShellFish on iOS and iPadOS, directly or inside tmux, over ssh or not.
+A tool asks it by capability and never looks at a terminal itself, so a new terminal changes this file alone.
 
 Standard library only, Python 3.9 or newer, macOS or Linux (it uses `termios`).
 
@@ -20,6 +20,9 @@ got = my_term.image_from(typed, keep_dir)   # a typed or pasted answer: an image
 if got and got.how == "elsewhere":
     print(got.path, "--", got.said)          # a path on another machine: what to do instead
 
+prompt = my_term.Prompt(("y", "n", "C", "r"), {"r": "run"})
+key = prompt.read()              # [y]es [n]o [C]ancel [r]un: ; no Enter
+
 print("\n" * 9)                # the text first, 10 rows kept free for the image
 if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
     print(png_path)              # cannot be drawn here: name the file
@@ -31,6 +34,26 @@ if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
   after it, so a terminal that does not know XTVERSION ends the wait at once. Inside tmux, tmux answers XTVERSION
   for itself, so tmux is asked instead: the terminal its client names (`client_termtype`) and whether
   `allow-passthrough` is on. Not a terminal, or no answer within 200 ms: `other`, and no image is drawn.
+- **`cell_size()` -> `tuple[int, int] | None`**: the cell's height and width in pixels, or `None` when unknown.
+  Directly it asks the terminal with CSI 16 t; inside tmux it reads the window's cell dimensions. Call it again
+  after a resize. It waits at most 200 ms for a direct answer and does not require tmux passthrough.
+- **`Prompt(keys, labels=None, fd_in=0, fd_out=1)`** draws a key line and reads one of the offered keys with
+  `read(wait=0, draw=True)`. The shared labels are `y` yes, `n` no, `o` ok, `w` write, `?` unclear, `s` skip,
+  `@` later or agent, `u` undo, `e` edit, `v` view, `c` cycle, `C` cancel, `Q` quit and `A` apply. Supply a
+  label for each other key; a label overriding a shared key or naming an unoffered key raises `ValueError`.
+  Unoffered input rings the bell and is refused. `read` returns `None` after `wait` seconds (zero waits without
+  a timeout); `draw=False` continues a timed wait without repeating the line. `draw()` draws it separately,
+  before other output such as an image; follow it with `read(draw=False)`. Reuse the prompt across waits:
+  split UTF-8 and arrow sequences stay pending. Ctrl-C raises `KeyboardInterrupt`, EOF raises `EOFError`, and
+  the terminal mode is restored. `discard()` clears typed-ahead input before a new question; reads otherwise
+  keep it, so a key followed by text leaves that text for the caller. When `v` is offered, space returns `v`;
+  without `v`, space can be offered as its own key. `read(resized=callback)` returns `KEY_RESIZED` when the
+  callback consumes a resize notification, within 100 ms. `read(refused=callback)` passes an unoffered key to
+  the callback instead of ringing the bell; the callback can report it and redraw. The caller handles what each
+  accepted key does.
+- `Prompt(..., mark={"y": "✅ (recommended)"})` adds a mark after the shared label; `quiet="g"` accepts an
+  offered key without drawing it. `style="2"` dims the line; `wrap_before="@"` breaks before that visible key
+  when the line exceeds the terminal width. `width=<columns>` supplies a width instead of reading the terminal.
 - **`image_from(text, keep_dir)` -> `Pasted | None`**: a path naming a readable image file here is that file
   (ShellFish uploads a pasted image and types its path; a file dragged in); an absolute image path that is not here
   is `elsewhere` (iTerm2's "Save to Temp File and Paste Path" over ssh types a path on the Mac), with the hint to
@@ -45,8 +68,6 @@ if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
   asked for its cursor (DSR) and tmux for the pane's place in the window. tmux does not know the image: it is gone
   when tmux redraws those cells. `False`: it cannot be drawn here (`term.draws()`, or the pane's place not found)
   and nothing was written -- name the file.
-
-ere (`term.draws()`, or the pane's place not found) and nothing was written -- name the file.
 
 **What is drawn where** -- `Terminal.draws()`:
 
@@ -74,6 +95,14 @@ usage: my_term.py [-h] [--version] [--run-tests [<filter>]] [kind | show <PNG>]
 Errors are one line on stderr, `ERROR <code> [<rc>]: ...`; Ctrl-C ends with one line and 130.
 
 ## Learned
+
+### 2026-11-24 00:51  #FROM:my-ai/my_ai.py@73a0bf549
+
+- The walk reads a key without Enter, retains keys read ahead, and uses timed waits to refresh its view.
+
+### 2026-11-23 20:57  #FROM:`man tmux` (tmux 3.8)
+
+- `window_cell_height` and `window_cell_width` are the window's cell dimensions in pixels.
 
 ### 2026-11-23 13:25  #FROM:`man tmux` (tmux 3.8)
 
