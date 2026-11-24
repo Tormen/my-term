@@ -1,9 +1,9 @@
 # my-term
 
 One Python module, `my_term.py`, for **terminal detection**, **images pasted or shown**, **interactive key
-prompts** and **the window's width** -- for iTerm2 on macOS and Secure ShellFish on iOS and iPadOS, directly or
-inside tmux, over ssh or not. A tool asks it by capability and never looks at a terminal itself, so a new terminal
-changes this file alone.
+prompts**, **the window's width** and **a busy line** -- for iTerm2 on macOS and Secure ShellFish on iOS and
+iPadOS, directly or inside tmux, over ssh or not. A tool asks it by capability and never looks at a terminal
+itself, so a new terminal changes this file alone.
 
 Standard library only, Python 3.9 or newer, macOS or Linux (it uses `termios`).
 
@@ -20,6 +20,10 @@ print(term.said())               # terminal: iterm2 (XTVERSION 'iTerm2 3.7.7') -
 got = my_term.image_from(typed, keep_dir)   # a typed or pasted answer: an image, or None (text)
 if got and got.how == "elsewhere":
     print(got.path, "--", got.said)          # a path on another machine: what to do instead
+
+with my_term.Busy("sending your 1 answer to ada") as b:    # a scanner beside it while it runs
+    rc = push(answers)
+    b.done(f"#45 sent [rc {rc}]")                           # then: #45 sent [rc 0], 61s
 
 prompt = my_term.Prompt(("y", "n", "C", "r"), {"r": "run"})
 key = prompt.read()              # [y]es [n]o [C]ancel [r]un: ; no Enter
@@ -77,6 +81,16 @@ if not my_term.show(term, png, cols=40, rows=10, up=10, col=1):
   through passthrough, the window widened by what the pane lacks, and watches the size for up to 1 s. A terminal
   that does not obey, tmux without passthrough, or no terminal: `False` -- the caller says what it needed. Which
   terminals obey: not yet tried (`python3 my_term.py widen 120` answers it in one).
+- **`Busy(text, stdout=None)`**: a context manager around slow work. On a terminal it draws TEXT, a scanner (a
+  block with a dim fading tail that runs back and forth in 8 cells) and, after 1 s, the seconds since it started,
+  redrawn in place every 80 ms by a thread of its own. `b.done(result)` makes the line, when the block ends, RESULT
+  and the time it took (`#45 sent [rc 0], 61s`); without it the line becomes `<text> -- done, 61s`. `b.say(line)`
+  prints a line above the moving one: output while it runs goes through it, anything else breaks the line. If the
+  block raises -- Ctrl-C among it -- the line is cleared and the exception goes on, so the tool's own ERROR or
+  interrupt line stands alone. TEXT is cut to fit the window. Not a terminal (a log, a pipe): nothing while it
+  runs, the result line at the end. It writes `stdout`, `sys.stdout` unless given; plain `\r` and `ESC [ K`, the
+  same in iTerm2, ShellFish and tmux; the scanner in the terminal's own color, as red, yellow and green mean
+  something else. It reads no input: keys typed meanwhile stay for the next `Prompt`.
 - **`image_from(text, keep_dir)` -> `Pasted | None`**: a path naming a readable image file here is that file
   (ShellFish uploads a pasted image and types its path; a file dragged in); an absolute image path that is not here
   is `elsewhere` (iTerm2's "Save to Temp File and Paste Path" over ssh types a path on the Mac), with the hint to
@@ -105,13 +119,15 @@ One protocol, kitty's: both terminals draw it, and only it passes tmux. iTerm2's
 ## From a shell
 
 ```
-usage: my_term.py [-h] [--version] [--run-tests [<filter>]] [kind | show <PNG> | widen <COLUMNS>]
+usage: my_term.py [-h] [--version] [--run-tests [<filter>]] [kind | show <PNG> | widen <COLUMNS> |
+                  busy <SECONDS>]
 ```
 
 - `python3 my_term.py kind` -- the terminal, what named it, whether images are drawn.
 - `python3 my_term.py show <PNG>` -- draws it 20 cells wide, or says why not.
 - `python3 my_term.py widen <COLUMNS>` -- asks the terminal for a window that wide: `widen 120: 120 columns
   (was 90) -- fits`, rc 0; rc 1 when it stays narrower.
+- `python3 my_term.py busy <SECONDS>` -- the busy line with its scanner for that long, then `busy 3 -- done, 3s`.
 - `python3 my_term.py --run-tests [<filter>]` -- its tests, TAP (`1..N`, then `ok K - title` per test), those whose
   title holds the filter. A terminal is faked on a pty, tmux by a stand-in: no real terminal is needed.
 - `python3 my_term.py --version` -- the version, git's describe when run in its own checkout, and the build (the

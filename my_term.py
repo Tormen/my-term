@@ -2,9 +2,10 @@
 """my_term -- the one module that knows the terminal.
 
 Which terminal it is, an image pasted into it, an image shown in it, a
-key prompt, the window's width: for iTerm2 (macOS) and Secure ShellFish
-(iOS, iPadOS), directly or inside tmux, over ssh or not. A tool asks it by
-capability -- detect(), image_from(), show(), Prompt, widen() -- and never
+key prompt, the window's width, a busy line: for iTerm2 (macOS) and Secure
+ShellFish (iOS, iPadOS), directly or inside tmux, over ssh or not. A tool
+asks it by capability -- detect(), image_from(), show(), Prompt, widen(),
+Busy -- and never
 looks at a terminal itself, so a new terminal changes this file alone.
 
 Python 3.9 grammar and the standard library only. `python3 my_term.py -h`
@@ -701,10 +702,121 @@ def png_size(png: bytes) -> tuple[int, int] | None:
 
 
 # -------------------------------------------------------------------------
+# slow work: a busy line
+# -------------------------------------------------------------------------
+
+BUSY_CELLS: Final = 8                   # the scanner's width
+BUSY_TICK: Final = 0.08                 # seconds between two of its frames
+BUSY_SECONDS_FROM: Final = 1.0          # the seconds since the start shown from then on
+SCANNER_TAIL: Final = "▓▒░"             # behind the head, nearest first
+
+
+def scanner(tick: int, dim: bool = True) -> str:
+    """The scanner at frame TICK: a head █ running back and forth across
+    BUSY_CELLS, its tail SCANNER_TAIL behind it -- dim, when DIM."""
+    span = BUSY_CELLS - 1
+    pos = tick % (2 * span)
+    forward = pos < span
+    head = pos if forward else 2 * span - pos
+    row = [" "] * BUSY_CELLS
+    for i, ch in enumerate(SCANNER_TAIL, 1):
+        at = head - i if forward else head + i
+        if 0 <= at < BUSY_CELLS:
+            row[at] = f"\x1b[2m{ch}\x1b[22m" if dim else ch
+    row[head] = "█"
+    return "".join(row)
+
+
+def cut(text: str, room: int) -> str:
+    """TEXT in at most ROOM cells: cut, with … at its end, when longer."""
+    if cells(text) <= room:
+        return text
+    while text and cells(text) > room - 1:
+        text = text[:-1]
+    return text + "…" if room > 0 else ""
+
+
+class Busy:
+    """A line saying what slow work runs, around it: `with Busy(text) as b:`.
+
+    On a terminal TEXT shows with a scanner moving beside it, and after
+    BUSY_SECONDS_FROM the seconds since the start, redrawn in place every
+    BUSY_TICK by a thread of its own. When the block ends, the line becomes
+    done()'s result and the time it took (`#45 sent [rc 0], 61s`), else
+    `<text> -- done, 61s`. If the block raises -- Ctrl-C among it -- the
+    line is cleared and the exception goes on, so the tool's own ERROR or
+    interrupt line stands alone. Not a terminal: nothing while it runs, the
+    result line at the end. It writes STDOUT, sys.stdout unless given."""
+
+    def __init__(self, text: str, stdout: TextIO | None = None) -> None:
+        self.text = text
+        self.out = sys.stdout if stdout is None else stdout
+        self.live = self.out.isatty()
+        self.result: str | None = None
+        self.start = time.monotonic()
+        self.tick = 0
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> Busy:
+        self.start = time.monotonic()
+        if self.live:
+            self._draw()
+            self.thread.start()
+        return self
+
+    def __exit__(self, kind: type[BaseException] | None, value: BaseException | None, trace: object) -> None:
+        self.stop.set()
+        if self.thread.is_alive():
+            self.thread.join()
+        took = f"{int(time.monotonic() - self.start)}s"
+        line = "" if kind is not None else (f"{self.result}, {took}" if self.result is not None
+                                            else f"{self.text} -- done, {took}")
+        with self.lock:
+            self.out.write(("\r\x1b[K" if self.live else "") + (line + "\n" if line else ""))
+            self.out.flush()
+
+    def done(self, result: str) -> None:
+        """The line that replaces the busy one when the block ends: RESULT and the time it took."""
+        self.result = result
+
+    def say(self, line: str) -> None:
+        """LINE printed above the busy one, which goes on below it: output while the work runs."""
+        with self.lock:
+            self.out.write(("\r\x1b[K" if self.live else "") + line + "\n")
+            if self.live:
+                self.out.write(self._frame())
+            self.out.flush()
+
+    def _run(self) -> None:
+        while not self.stop.wait(BUSY_TICK):
+            self.tick += 1
+            self._draw()
+
+    def _frame(self) -> str:
+        try:
+            width = os.get_terminal_size(self.out.fileno()).columns or 80
+        except (OSError, ValueError):
+            width = 80
+        took = time.monotonic() - self.start
+        seconds = f"  {int(took)}s" if took >= BUSY_SECONDS_FROM else ""
+        room = width - 1 - (BUSY_CELLS + 4) - len(seconds)
+        return f"\r{cut(self.text, room)}  [{scanner(self.tick)}]{seconds}\x1b[K"
+
+    def _draw(self) -> None:
+        with self.lock:
+            if not self.stop.is_set():
+                self.out.write(self._frame())
+                self.out.flush()
+
+
+# -------------------------------------------------------------------------
 # the command line: try it from a shell
 # -------------------------------------------------------------------------
 
-USAGE: Final = f"usage: {NAME}.py [-h] [--version] [--run-tests [<filter>]] [kind | show <PNG> | widen <COLUMNS>]"
+USAGE: Final = f"usage: {NAME}.py [-h] [--version] [--run-tests [<filter>]] [kind | show <PNG> | widen <COLUMNS> |\n" \
+                    "                  busy <SECONDS>]"
 HELP: Final = f"""{USAGE}
 
 The one module that knows the terminal (iTerm2, Secure ShellFish; directly or
@@ -713,6 +825,7 @@ inside tmux). Tools import it; from a shell it shows what it finds:
   kind          the terminal, what named it, and whether images are drawn
   show <PNG>    draw the PNG at the cursor, {20} cells wide -- or say why not
   widen <COLUMNS>   ask the terminal for a window that wide; rc 0 when it is
+  busy <SECONDS>    the busy line with its scanner for that long, then its result
   --run-tests [<filter>]   its tests (TAP), those whose title holds FILTER
   --version     the version, the git release when run in its own checkout,
                 and the build (the file's own hash)
@@ -768,6 +881,10 @@ def main(argv: Sequence[str]) -> int:
         print("\n" * (rows - 1), flush=True)                               # the rows it is drawn over
         if not show(term, png, SHOW_COLS, rows, rows, 1):
             print(f"{args[1]} -- not drawn: tmux did not say where the pane is")
+        return 0
+    if args[0] == "busy" and len(args) == 2 and args[1].isdigit():
+        with Busy(f"busy {args[1]}"):
+            time.sleep(int(args[1]))
         return 0
     if args[0] == "widen" and len(args) == 2 and args[1].isdigit():
         try:
@@ -1216,6 +1333,87 @@ def t_widen(t: T) -> None:
             and widths == [["tmux", "display-message", "-p", TMUX_WIDTHS]], repr((widths, seen[-40:])))
 
 
+def frames(seen: bytes) -> list[str]:
+    """What a busy line drew, one frame each: its \\r-separated parts, SGR and erase removed."""
+    text = re.sub(r"\x1b\[[0-9;]*[mK]", "", seen.decode("utf-8", "replace"))
+    return [f for f in text.split("\r") if f]
+
+
+def t_busy_scanner(t: T) -> None:
+    got = [scanner(k, dim=False) for k in (0, 3, 7, 8, 10, 14)]
+    t.check("the head runs right with its tail behind, turns, runs back",
+            got == ["█       ", "░▒▓█    ", "       █", "      █▓", "    █▓▒░", "█       "], repr(got))
+    t.check("the tail dim", scanner(3).startswith("\x1b[2m░\x1b[22m"), repr(scanner(3)))
+
+
+def t_busy_terminal(t: T) -> None:
+    fake = FakeTerminal({})
+    fcntl.ioctl(fake.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 30, 0, 0))
+    _, out = fake.streams()
+    try:
+        with Busy("sending your 1 answer to ada", out) as b:
+            time.sleep(0.3)
+            b.say("a note")
+            b.start -= 5
+            time.sleep(0.2)
+            b.done("#45 sent [rc 0]")
+        Busy("waiting", out).say("x")                 # no thread to draw it again: say itself does
+    finally:
+        seen = fake.close()
+    drawn = frames(seen)
+    moving = [f for f in drawn if "[" in f and "█" in f]
+    t.check("the line redrawn in place, the scanner moving", len(moving) >= 4 and len(set(moving)) >= 3,
+            repr(drawn[:6]))
+    t.check("no frame wider than the window less one", all(cells(f.rstrip("\n")) <= 29 for f in moving),
+            repr([f for f in moving if cells(f) > 29][:2]))
+    t.check("the text cut to fit", any(f.startswith("sending your 1 a…  [") for f in moving), repr(moving[:2]))
+    t.check("the seconds once past the first", any(f.endswith("  5s") for f in moving), repr(moving[-2:]))
+    t.check("say: its line above, the busy line again below", "\r\x1b[Ka note\r\n\r" in seen.decode(), repr(seen[-200:]))
+    t.check("the result line with the time it took, in place of the busy one",
+            "\r\x1b[K#45 sent [rc 0], 5s\r\n".encode() in seen, repr(seen[-60:]))
+    t.check("say draws the busy line again itself", "\r\x1b[Kx\r\n\rwaiting  [".encode() in seen, repr(seen[-60:]))
+
+
+def t_busy_not_a_terminal(t: T) -> None:
+    out = io.StringIO()
+    with Busy("sending", out) as b:
+        b.say("a note")
+        b.done("#45 sent [rc 0]")
+    plain = io.StringIO()
+    with Busy("rebuilding the index", plain):
+        pass
+    t.check("nothing moves; say's line and the result line", out.getvalue() == "a note\n#45 sent [rc 0], 0s\n",
+            repr(out.getvalue()))
+    t.check("without done(): the text, done", plain.getvalue() == "rebuilding the index -- done, 0s\n",
+            repr(plain.getvalue()))
+
+
+def t_busy_raises(t: T) -> None:
+    out = io.StringIO()
+    try:
+        with Busy("sending", out):
+            raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        interrupted = True
+    else:
+        interrupted = False
+    fake = FakeTerminal({})
+    _, tty = fake.streams()
+    try:
+        try:
+            with Busy("sending", tty):
+                time.sleep(0.1)
+                raise ValueError("x")
+        except ValueError:
+            pass
+    finally:
+        seen = fake.close()
+    t.check("Ctrl-C goes on, nothing printed where nothing moved", interrupted and out.getvalue() == "",
+            repr(out.getvalue()))
+    t.check("on a terminal the line cleared, no result line", seen.endswith(b"\r\x1b[K") and b"done" not in seen,
+            repr(seen[-40:]))
+
+
 def t_kind_of(t: T) -> None:
     t.check("iTerm2's answer", kind_of("iTerm2 3.7.7") == "iterm2")
     t.check("ShellFish's name", kind_of("Secure ShellFish 2026.35") == "shellfish")
@@ -1457,6 +1655,10 @@ TESTS: Final[Sequence[tuple[str, Callable[[T], None]]]] = (
     ("prompt: a submenu offers its keys and Esc", t_prompt_submenu),
     ("prompt: keys typed while the terminal answers are kept", t_typed_ahead),
     ("widen: the window asked for more columns", t_widen),
+    ("busy: the scanner runs back and forth", t_busy_scanner),
+    ("busy: on a terminal, a line in place, then the result", t_busy_terminal),
+    ("busy: not a terminal, the result line alone", t_busy_not_a_terminal),
+    ("busy: the block raises, the line cleared", t_busy_raises),
     ("cell size: direct and tmux", t_cell_size),
     ("kind: XTVERSION's answer names the terminal", t_kind_of),
     ("detect: directly, by XTVERSION", t_detect_direct),
